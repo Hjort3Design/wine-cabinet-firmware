@@ -1,5 +1,5 @@
-{
-  "version": "v1.1.4",
-  "notes": "Door sensor debounce, schedule now keeps lights on during set hours, GPIO 0 cycle mode button",
-  "bin_url": "https://raw.githubusercontent.com/Hjort3Design/wine-cabinet-firmware/main/releases/v1.1.4/firmware.bin"
+﻿{
+  "version": "v1.1.5",
+  "notes": "Fixes random switches to Force On caused by button noise, automatic daylight saving time, schedule waits for a valid clock after reboot, mode-change diagnostics on the status page",
+  "bin_url": "https://raw.githubusercontent.com/Hjort3Design/wine-cabinet-firmware/main/releases/v1.1.5/firmware.bin"
 }
