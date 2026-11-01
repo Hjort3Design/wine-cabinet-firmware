@@ -6,6 +6,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_system.h>
 #include "version.h"
 
 namespace Config {
@@ -30,12 +31,23 @@ constexpr char kDeviceName[] = "wine-cabinet-dimmer";
 constexpr char kWiFiPortalName[] = "WineCabinetDimmer";
 constexpr char kOtaPassword[] = "";
 
-constexpr unsigned long kButtonDebounceMs = 50;
+constexpr unsigned long kButtonDebounceMs = 50;  // door sensors
+// Mode buttons need a deliberate press: the level must hold for kButtonPressMs
+// across at least kButtonMinSamples loop passes, and each sample is itself
+// kButtonFilterReads back-to-back reads that must all be LOW. Guards against
+// noise (e.g. coupled from the MOSFET PWM) flipping the mode on its own.
+constexpr unsigned long kButtonPressMs = 150;
+constexpr uint16_t kButtonMinSamples = 10;
+constexpr uint8_t kButtonFilterReads = 8;
 constexpr unsigned long kPortalTimeoutSeconds = 180;
 
 constexpr char kNtpServer[] = "pool.ntp.org";
-constexpr long  kGmtOffsetSec = 3600;      // UTC+1 (CET) — adjust for your timezone
-constexpr int   kDaylightOffsetSec = 3600; // +1 hour DST
+// POSIX TZ: CET/CEST with EU DST rules (last Sun of Mar 02:00 -> last Sun of
+// Oct 03:00) — adjust for your timezone.
+constexpr char kTimeZone[] = "CET-1CEST,M3.5.0,M10.5.0/3";
+// Clock counts as synced once time() is past this (2024-01-01); before the
+// first NTP reply the RTC starts at 1970.
+constexpr time_t kMinValidEpoch = 1704067200;
 }  // namespace Config
 
 enum class ControlMode : uint8_t {
@@ -59,6 +71,9 @@ Preferences prefs;
 char g_hostname[32] = "wine-cabinet";
 
 ControlMode g_controlMode = ControlMode::kAuto;
+// What last changed g_controlMode, and when (millis()) — reported on /status.
+const char* g_modeChangeSource = "boot";
+unsigned long g_modeChangeMs = 0;
 StatusLedMode g_statusLedMode = StatusLedMode::kBooting;
 
 bool g_wifiConnected = false;
@@ -71,10 +86,12 @@ bool g_otaServicesStarted = false;
 bool g_lastRawButtonPressed = false;
 bool g_stableButtonPressed = false;
 unsigned long g_lastButtonChangeMs = 0;
+uint16_t g_buttonSamplesSinceChange = 0;
 
 bool g_lastRawCycleButtonPressed = false;
 bool g_stableCycleButtonPressed = false;
 unsigned long g_lastCycleButtonChangeMs = 0;
+uint16_t g_cycleButtonSamplesSinceChange = 0;
 
 bool g_lastRawDoor1 = false;
 bool g_stableDoor1 = false;
@@ -119,8 +136,60 @@ bool readActiveLowInput(uint8_t pin) {
   return digitalRead(pin) == LOW;
 }
 
+// Mode buttons only: pressed only if every one of several back-to-back reads
+// is LOW, so a single noise spike can't register as a press sample.
+bool readButtonFiltered(uint8_t pin) {
+  for (uint8_t i = 0; i < Config::kButtonFilterReads; ++i) {
+    if (digitalRead(pin) != LOW) {
+      return false;
+    }
+    delayMicroseconds(10);
+  }
+  return true;
+}
+
 void triggerDebugBlink() {
   g_ledBlinkUntilMs = millis() + 500;
+}
+
+ControlMode nextControlMode(ControlMode mode) {
+  switch (mode) {
+    case ControlMode::kAuto:     return ControlMode::kForceOn;
+    case ControlMode::kForceOn:  return ControlMode::kForceOff;
+    case ControlMode::kForceOff: return ControlMode::kAuto;
+  }
+  return ControlMode::kAuto;
+}
+
+// Single place every mode change goes through, so /status can report what
+// last changed the mode (source) and how long ago.
+void setControlMode(ControlMode mode, const char* source) {
+  g_controlMode = mode;
+  g_modeChangeSource = source;
+  g_modeChangeMs = millis();
+  g_bothDoorsOpenSinceMs = g_modeChangeMs;
+  triggerDebugBlink();
+}
+
+// Fills `t` with local time without blocking. getLocalTime() would wait up to
+// 5 s per call while the clock is unsynced, stalling loop().
+bool getLocalTimeNow(struct tm& t) {
+  if (!g_ntpSynced) {
+    return false;
+  }
+  const time_t now = time(nullptr);
+  localtime_r(&now, &t);
+  return true;
+}
+
+void updateNtpSynced() {
+  if (!g_ntpSynced && time(nullptr) > Config::kMinValidEpoch) {
+    g_ntpSynced = true;
+  }
+}
+
+void startTimeSync() {
+  configTzTime(Config::kTimeZone, Config::kNtpServer);
 }
 
 bool isAnyDoorOpen() {
@@ -138,12 +207,12 @@ bool isDoor2Open() {
 // Returns true if the current local time falls within the allowed window.
 // Handles overnight ranges (e.g. 22:00 – 06:00) correctly.
 bool isWithinSchedule() {
-  if (!g_ntpSynced) {
-    return true; // no time yet — don't block lights
-  }
+  // No valid time yet (e.g. just rebooted, NTP unreachable): the schedule
+  // stays inactive rather than holding the lights on at an unknown hour.
+  // Doors still light the cabinet in Auto.
   struct tm t;
-  if (!getLocalTime(&t)) {
-    return true;
+  if (!getLocalTimeNow(t)) {
+    return false;
   }
   // tm_wday: 0=Sun,1=Mon…6=Sat — map to bit 0=Mon…bit 6=Sun
   const uint8_t wday = (t.tm_wday == 0) ? 6 : (t.tm_wday - 1);
@@ -334,8 +403,7 @@ void handleBothDoorsOpenTimeout() {
       g_bothDoorsOpenSinceMs = now;
     } else if (g_controlMode != ControlMode::kAuto &&
                now - g_bothDoorsOpenSinceMs >= g_bothDoorsTimeoutMs) {
-      g_controlMode = ControlMode::kAuto;
-      triggerDebugBlink();
+      setControlMode(ControlMode::kAuto, "door timeout");
     }
   } else {
     g_bothDoorsWereOpen = false;
@@ -344,14 +412,22 @@ void handleBothDoorsOpenTimeout() {
 
 void handleOverrideButton() {
   const unsigned long now = millis();
-  const bool rawPressed = readActiveLowInput(Config::kOverrideButtonPin);
+  const bool rawPressed = readButtonFiltered(Config::kOverrideButtonPin);
 
   if (rawPressed != g_lastRawButtonPressed) {
     g_lastRawButtonPressed = rawPressed;
     g_lastButtonChangeMs = now;
+    g_buttonSamplesSinceChange = 0;
+  }
+  if (g_buttonSamplesSinceChange < UINT16_MAX) {
+    ++g_buttonSamplesSinceChange;
   }
 
-  if (now - g_lastButtonChangeMs < Config::kButtonDebounceMs) {
+  // Time alone isn't enough: if loop() stalls (e.g. serving the page's 1 s
+  // /status poll) two noisy samples either side of the stall would pass a
+  // pure time check. Also require many consistent samples.
+  if (now - g_lastButtonChangeMs < Config::kButtonPressMs ||
+      g_buttonSamplesSinceChange < Config::kButtonMinSamples) {
     return;
   }
 
@@ -365,25 +441,25 @@ void handleOverrideButton() {
     return;
   }
 
-  switch (g_controlMode) {
-    case ControlMode::kAuto:     g_controlMode = ControlMode::kForceOn;  break;
-    case ControlMode::kForceOn:  g_controlMode = ControlMode::kForceOff; break;
-    case ControlMode::kForceOff: g_controlMode = ControlMode::kAuto;     break;
-  }
-  g_bothDoorsOpenSinceMs = millis();
-  triggerDebugBlink();
+  setControlMode(nextControlMode(g_controlMode), "button GPIO 21");
 }
 
 void handleCycleModeButton() {
   const unsigned long now = millis();
-  const bool rawPressed = readActiveLowInput(Config::kCycleModeButtonPin);
+  const bool rawPressed = readButtonFiltered(Config::kCycleModeButtonPin);
 
   if (rawPressed != g_lastRawCycleButtonPressed) {
     g_lastRawCycleButtonPressed = rawPressed;
     g_lastCycleButtonChangeMs = now;
+    g_cycleButtonSamplesSinceChange = 0;
+  }
+  if (g_cycleButtonSamplesSinceChange < UINT16_MAX) {
+    ++g_cycleButtonSamplesSinceChange;
   }
 
-  if (now - g_lastCycleButtonChangeMs < Config::kButtonDebounceMs) {
+  // See handleOverrideButton() for why both time and sample count are checked.
+  if (now - g_lastCycleButtonChangeMs < Config::kButtonPressMs ||
+      g_cycleButtonSamplesSinceChange < Config::kButtonMinSamples) {
     return;
   }
 
@@ -397,13 +473,7 @@ void handleCycleModeButton() {
     return;
   }
 
-  switch (g_controlMode) {
-    case ControlMode::kAuto:     g_controlMode = ControlMode::kForceOn;  break;
-    case ControlMode::kForceOn:  g_controlMode = ControlMode::kForceOff; break;
-    case ControlMode::kForceOff: g_controlMode = ControlMode::kAuto;     break;
-  }
-  g_bothDoorsOpenSinceMs = millis();
-  triggerDebugBlink();
+  setControlMode(nextControlMode(g_controlMode), "button GPIO 0");
 }
 
 // CSS served as a separate endpoint to keep HTML clean.
@@ -550,12 +620,10 @@ String buildWebOtaPage() {
 
   // Current local time for display
   char timeBuf[9] = "–";
-  if (g_ntpSynced) {
-    struct tm t;
-    if (getLocalTime(&t)) {
-      snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
-               t.tm_hour, t.tm_min, t.tm_sec);
-    }
+  struct tm t;
+  if (getLocalTimeNow(t)) {
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+             t.tm_hour, t.tm_min, t.tm_sec);
   }
 
   String html;
@@ -614,6 +682,8 @@ String buildWebOtaPage() {
   html += F("</div></div>"
 
             "</div>"  // .status-grid
+            "<p id='val-diag' style='margin:12px 0 0;font-size:.76rem;color:var(--ink-muted);"
+            "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'></p>"
             "<div style='margin-top:16px;'>"
             "<button class='btn' type='button' onclick='cycleMode()' id='mode-btn'>"
             "&#x1F4A1;&nbsp;Cycle Mode"
@@ -839,6 +909,10 @@ String buildWebOtaPage() {
             "if(m==='FORCE_OFF') return\"<span class='badge badge-off'>FORCE OFF</span>\";"
             "return\"<span class='badge badge-auto'>AUTO</span>\";"
             "}"
+            "function fmtDur(s){"
+            "var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);"
+            "if(d)return d+'d '+h+'h';if(h)return h+'h '+m+'m';return m+'m';"
+            "}"
             "function pollStatus(){"
             "fetch('/status').then(function(r){return r.json();}).then(function(d){"
             "document.getElementById('val-door1').innerHTML=badge(d.door1,['OPEN','CLOSED']);"
@@ -846,6 +920,9 @@ String buildWebOtaPage() {
             "document.getElementById('val-mode').innerHTML=modeBadge(d.mode);"
             "if(d.time){document.getElementById('val-time').textContent=d.time;}"
             "if(d.rssi!=null){document.getElementById('val-rssi').textContent=d.rssi+' dBm';}"
+            "if(d.uptime!=null){document.getElementById('val-diag').textContent="
+            "'Mode set by '+d.mode_src+', '+fmtDur(d.mode_age)+' ago \\u00b7 '"
+            "+'Up '+fmtDur(d.uptime)+' \\u00b7 Last reset: '+d.reset;}"
             "}).catch(function(){});"
             "}"
             "setInterval(pollStatus,1000);"
@@ -985,17 +1062,31 @@ void handleWebCss() {
   webServer.send_P(200, "text/css", kPageCss);
 }
 
+const char* resetReasonLabel() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_EXT:       return "reset pin";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    default:                return "unknown";
+  }
+}
+
 void handleWebStatus() {
   char timeBuf[9] = "";
-  if (g_ntpSynced) {
-    struct tm t;
-    if (getLocalTime(&t)) {
-      snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
-               t.tm_hour, t.tm_min, t.tm_sec);
-    }
+  struct tm t;
+  if (getLocalTimeNow(t)) {
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+             t.tm_hour, t.tm_min, t.tm_sec);
   }
+  const unsigned long now = millis();
   String json;
-  json.reserve(120);
+  json.reserve(220);
   json += F("{\"door1\":");
   json += isDoor1Open() ? "true" : "false";
   json += F(",\"door2\":");
@@ -1008,7 +1099,15 @@ void handleWebStatus() {
   json += timeBuf;
   json += F("\",\"rssi\":");
   json += WiFi.isConnected() ? String(WiFi.RSSI()) : "null";
-  json += F("}");
+  json += F(",\"mode_src\":\"");
+  json += g_modeChangeSource;
+  json += F("\",\"mode_age\":");
+  json += String((now - g_modeChangeMs) / 1000UL);
+  json += F(",\"uptime\":");
+  json += String(now / 1000UL);
+  json += F(",\"reset\":\"");
+  json += resetReasonLabel();
+  json += F("\"}");
   webServer.send(200, "application/json", json);
 }
 
@@ -1168,13 +1267,7 @@ void handleWebSetHostname() {
 }
 
 void handleWebCycleMode() {
-  switch (g_controlMode) {
-    case ControlMode::kAuto:     g_controlMode = ControlMode::kForceOn;  break;
-    case ControlMode::kForceOn:  g_controlMode = ControlMode::kForceOff; break;
-    case ControlMode::kForceOff: g_controlMode = ControlMode::kAuto;     break;
-  }
-  g_bothDoorsOpenSinceMs = millis();
-  triggerDebugBlink();
+  setControlMode(nextControlMode(g_controlMode), "web");
 
   const char* modeStr =
       (g_controlMode == ControlMode::kForceOn)  ? "FORCE_ON"  :
@@ -1276,8 +1369,7 @@ void serviceWiFiPortal() {
     g_portalActive = false;
     g_wifiConnected = true;
     setStatusLedMode(StatusLedMode::kConnected);
-    configTime(Config::kGmtOffsetSec, Config::kDaylightOffsetSec, Config::kNtpServer);
-    g_ntpSynced = true;
+    startTimeSync();
     setupArduinoOta();
     setupWebOta();
     startMdns();
@@ -1306,10 +1398,10 @@ void setupInputs() {
   pinMode(Config::kOverrideButtonPin, INPUT_PULLUP);
   pinMode(Config::kCycleModeButtonPin, INPUT_PULLUP);
 
-  g_lastRawButtonPressed = readActiveLowInput(Config::kOverrideButtonPin);
+  g_lastRawButtonPressed = readButtonFiltered(Config::kOverrideButtonPin);
   g_stableButtonPressed = g_lastRawButtonPressed;
 
-  g_lastRawCycleButtonPressed = readActiveLowInput(Config::kCycleModeButtonPin);
+  g_lastRawCycleButtonPressed = readButtonFiltered(Config::kCycleModeButtonPin);
   g_stableCycleButtonPressed = g_lastRawCycleButtonPressed;
   g_lastRawDoor1 = !readActiveLowInput(Config::kDoorSensor1Pin);
   g_stableDoor1  = g_lastRawDoor1;
@@ -1357,8 +1449,7 @@ void setup() {
   if (g_wifiConnected) {
     Serial.print("Wi-Fi connected. IP: ");
     Serial.println(WiFi.localIP());
-    configTime(Config::kGmtOffsetSec, Config::kDaylightOffsetSec, Config::kNtpServer);
-    g_ntpSynced = true;
+    startTimeSync();
     setupArduinoOta();
     setupWebOta();
     startMdns();
@@ -1368,6 +1459,7 @@ void setup() {
 }
 
 void loop() {
+  updateNtpSynced();
   handleDoorInputs();
   handleOverrideButton();
   handleCycleModeButton();
