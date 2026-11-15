@@ -24,7 +24,7 @@ constexpr uint8_t kCycleModeButtonPin = 0;
 
 constexpr uint32_t kPwmFrequencyHz = 5000;
 constexpr uint8_t kPwmResolutionBits = 12;
-constexpr uint16_t kOnBrightness = 3000;
+constexpr uint16_t kOnBrightness = 4095;  // before any hold-to-dim adjustment
 constexpr unsigned long kFadeDurationMs = 800;
 
 constexpr char kDeviceName[] = "wine-cabinet-dimmer";
@@ -39,6 +39,12 @@ constexpr unsigned long kButtonDebounceMs = 50;  // door sensors
 constexpr unsigned long kButtonPressMs = 150;
 constexpr uint16_t kButtonMinSamples = 10;
 constexpr uint8_t kButtonFilterReads = 8;
+// Hold-to-dim on the override button (GPIO 21): held past kDimHoldMs it ramps
+// brightness (full range in kDimRampFullMs), alternating direction each hold.
+// A shorter press still cycles the mode, on release.
+constexpr unsigned long kDimHoldMs = 400;
+constexpr unsigned long kDimRampFullMs = 3000;
+constexpr uint16_t kDimMinBrightness = 80;  // dimming never goes fully dark
 constexpr unsigned long kPortalTimeoutSeconds = 180;
 
 constexpr char kNtpServer[] = "pool.ntp.org";
@@ -87,6 +93,10 @@ bool g_lastRawButtonPressed = false;
 bool g_stableButtonPressed = false;
 unsigned long g_lastButtonChangeMs = 0;
 uint16_t g_buttonSamplesSinceChange = 0;
+unsigned long g_buttonPressStartMs = 0;  // when the stable press began
+bool g_buttonDimming = false;            // current press turned into a dim ramp
+bool g_dimRampUp = true;                 // flipped at the start of each hold
+unsigned long g_lastDimStepMs = 0;
 
 bool g_lastRawCycleButtonPressed = false;
 bool g_stableCycleButtonPressed = false;
@@ -109,6 +119,8 @@ uint16_t g_fadeStartBrightness = 0;
 uint16_t g_targetBrightness = 0;
 unsigned long g_fadeStartMs = 0;
 bool g_fadeActive = false;
+// Hold-to-dim offset on top of kOnBrightness (see onBrightness()). NVS "dim_ofs".
+int16_t g_dimOffset = 0;
 
 // Scheduler: lights are allowed only between onHour:onMin and offHour:offMin.
 // If schedEnabled is false the schedule is ignored entirely.
@@ -337,13 +349,32 @@ void startFadeToBrightness(uint16_t duty) {
   }
 }
 
+// Jump straight to `duty`, cancelling any fade (used by the hold-to-dim ramp,
+// which steps every loop pass and would lag behind an 800 ms fade).
+void setBrightnessNow(uint16_t duty) {
+  g_fadeActive = false;
+  g_targetBrightness = duty;
+  setBrightnessImmediate(duty);
+}
+
+// Brightness the lights fade to when on: kOnBrightness shifted by the
+// hold-to-dim offset, kept within [kDimMinBrightness, 4095].
+uint16_t onBrightness() {
+  if (g_dimOffset == 0) {
+    return Config::kOnBrightness;
+  }
+  const int32_t level = static_cast<int32_t>(Config::kOnBrightness) + g_dimOffset;
+  return static_cast<uint16_t>(
+      constrain(level, static_cast<int32_t>(Config::kDimMinBrightness), 4095));
+}
+
 void applyLightingState(bool lightsOn) {
   if (g_lightsOn == lightsOn) {
     return;
   }
 
   g_lightsOn = lightsOn;
-  startFadeToBrightness(lightsOn ? Config::kOnBrightness : 0);
+  startFadeToBrightness(lightsOn ? onBrightness() : 0);
 }
 
 void updateFade() {
@@ -410,6 +441,61 @@ void handleBothDoorsOpenTimeout() {
   }
 }
 
+void saveDimPref();
+
+// One loop pass of the hold-to-dim ramp. The first pass of a hold picks the
+// direction; every pass then moves the level by the time elapsed.
+void updateDimRamp(unsigned long now) {
+  if (!g_buttonDimming) {
+    g_buttonDimming = true;
+    g_lastDimStepMs = now;
+    if (!g_lightsOn) {
+      // From off: switch on at the floor and ramp up.
+      setControlMode(ControlMode::kForceOn, "button GPIO 21 hold");
+      g_dimOffset = static_cast<int16_t>(
+          static_cast<int32_t>(Config::kDimMinBrightness) - Config::kOnBrightness);
+      g_dimRampUp = true;
+    } else {
+      const uint16_t level = onBrightness();
+      if (level <= Config::kDimMinBrightness)  g_dimRampUp = true;
+      else if (level >= 4095)                  g_dimRampUp = false;
+      else                                     g_dimRampUp = !g_dimRampUp;
+    }
+    setBrightnessNow(onBrightness());
+    return;
+  }
+
+  // Lights went off mid-hold (e.g. Auto and the door closed): stop driving
+  // the outputs so they stay off.
+  if (!g_lightsOn) {
+    return;
+  }
+
+  // Only consume elapsed time once it amounts to a whole step, otherwise a
+  // fast loop would round every step down to zero.
+  const int32_t step = static_cast<int32_t>(
+      (now - g_lastDimStepMs) * 4095UL / Config::kDimRampFullMs);
+  if (step == 0) {
+    return;
+  }
+  g_lastDimStepMs = now;
+
+  const int32_t level = constrain(
+      static_cast<int32_t>(onBrightness()) + (g_dimRampUp ? step : -step),
+      static_cast<int32_t>(Config::kDimMinBrightness), 4095);
+  g_dimOffset = static_cast<int16_t>(level - Config::kOnBrightness);
+  setBrightnessNow(static_cast<uint16_t>(level));
+}
+
+void endDimRamp() {
+  g_buttonDimming = false;
+  saveDimPref();
+  if (g_lightsOn) {
+    startFadeToBrightness(onBrightness());
+  }
+}
+
+// GPIO 21: short press cycles the mode (on release); hold dims.
 void handleOverrideButton() {
   const unsigned long now = millis();
   const bool rawPressed = readButtonFiltered(Config::kOverrideButtonPin);
@@ -426,22 +512,23 @@ void handleOverrideButton() {
   // Time alone isn't enough: if loop() stalls (e.g. serving the page's 1 s
   // /status poll) two noisy samples either side of the stall would pass a
   // pure time check. Also require many consistent samples.
-  if (now - g_lastButtonChangeMs < Config::kButtonPressMs ||
-      g_buttonSamplesSinceChange < Config::kButtonMinSamples) {
-    return;
+  const bool settled = now - g_lastButtonChangeMs >= Config::kButtonPressMs &&
+                       g_buttonSamplesSinceChange >= Config::kButtonMinSamples;
+
+  if (settled && rawPressed != g_stableButtonPressed) {
+    g_stableButtonPressed = rawPressed;
+    if (g_stableButtonPressed) {
+      g_buttonPressStartMs = now;  // short press or hold: decided later
+    } else if (g_buttonDimming) {
+      endDimRamp();
+    } else {
+      setControlMode(nextControlMode(g_controlMode), "button GPIO 21");
+    }
   }
 
-  if (rawPressed == g_stableButtonPressed) {
-    return;
+  if (g_stableButtonPressed && now - g_buttonPressStartMs >= Config::kDimHoldMs) {
+    updateDimRamp(now);
   }
-
-  g_stableButtonPressed = rawPressed;
-
-  if (!g_stableButtonPressed) {
-    return;
-  }
-
-  setControlMode(nextControlMode(g_controlMode), "button GPIO 21");
 }
 
 void handleCycleModeButton() {
@@ -1107,7 +1194,9 @@ void handleWebStatus() {
   json += String(now / 1000UL);
   json += F(",\"reset\":\"");
   json += resetReasonLabel();
-  json += F("\"}");
+  json += F("\",\"dim_ofs\":");
+  json += String(g_dimOffset);
+  json += F("}");
   webServer.send(200, "application/json", json);
 }
 
@@ -1215,6 +1304,7 @@ void loadPrefs() {
   g_schedOff.hour   = prefs.getUChar("sched_off_h", 23);
   g_schedOff.minute = prefs.getUChar("sched_off_m", 0);
   g_schedDays       = prefs.getUChar("sched_days",  0x7F);
+  g_dimOffset       = prefs.getShort("dim_ofs",     0);
   prefs.end();
 }
 
@@ -1238,6 +1328,12 @@ void saveSchedulePref() {
   prefs.putUChar("sched_off_h", g_schedOff.hour);
   prefs.putUChar("sched_off_m", g_schedOff.minute);
   prefs.putUChar("sched_days",  g_schedDays);
+  prefs.end();
+}
+
+void saveDimPref() {
+  prefs.begin("wine-cab", false);
+  prefs.putShort("dim_ofs", g_dimOffset);
   prefs.end();
 }
 
