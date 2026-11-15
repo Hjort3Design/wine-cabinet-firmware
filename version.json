@@ -1,5 +1,5 @@
 ﻿{
   "version": "v1.2.0",
-  "notes": "Hold the GPIO 21 button to dim: hold past ~0.5 s to ramp brightness, alternating up/down each hold; the level is remembered. A short press still cycles the mode. Default brightness is now 100%",
+  "notes": "New: hold the cabinet button (GPIO 21) to dim the lights. Each hold goes the other way, and your level is remembered. A short press still changes the mode, now when you release it. Lights now start at full brightness, so they may look brighter after updating. Just dim them to your liking. Also includes v1.1.5: fixes the lights changing mode by themselves, and adjusts automatically for daylight saving time.",
   "bin_url": "https://raw.githubusercontent.com/Hjort3Design/wine-cabinet-firmware/main/releases/v1.2.0/firmware.bin"
 }
