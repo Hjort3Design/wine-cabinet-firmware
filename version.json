@@ -1,5 +1,5 @@
 ﻿{
-  "version": "v1.1.5",
-  "notes": "Fixes random switches to Force On caused by button noise, automatic daylight saving time, schedule waits for a valid clock after reboot, mode-change diagnostics on the status page",
-  "bin_url": "https://raw.githubusercontent.com/Hjort3Design/wine-cabinet-firmware/main/releases/v1.1.5/firmware.bin"
+  "version": "v1.2.0",
+  "notes": "Hold the GPIO 21 button to dim: hold past ~0.5 s to ramp brightness, alternating up/down each hold; the level is remembered. A short press still cycles the mode. Default brightness is now 100%",
+  "bin_url": "https://raw.githubusercontent.com/Hjort3Design/wine-cabinet-firmware/main/releases/v1.2.0/firmware.bin"
 }
